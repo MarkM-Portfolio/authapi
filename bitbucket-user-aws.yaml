@@ -1,0 +1,47 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: CFN template to create the needed infra for bitbucket pipeline to be able to deploy the documentation
+
+Parameters:
+  TargetBucket:
+    Description: The S3 bucket where the documentation will be uploaded
+    Type: String
+    Default: atmail-api-dev
+
+Outputs:
+  BitbucketUserAccessKey:
+    Value:
+      !Ref BitbucketUserAccessKey
+  BitbucketUserSecretKey:
+    Value: !GetAtt BitbucketUserAccessKey.SecretAccessKey
+
+Resources:
+  BitbucketUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${AWS::StackName}-bitbucket-user"
+
+  BitbucketUserPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-bitbucket-user-policy"
+      PolicyDocument:
+        Statement:
+        - Sid: ListObjects
+          Effect: Allow
+          Action:
+          - s3:ListBucket
+          Resource: !Sub "arn:aws:s3:::${TargetBucket}"
+        - Sid: PutObjects
+          Effect: Allow
+          Action:
+          - s3:PutObject
+          Resource: !Sub "arn:aws:s3:::${TargetBucket}/*"
+      Users:
+        - !Ref BitbucketUser
+
+  BitbucketUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName:
+        !Ref BitbucketUser

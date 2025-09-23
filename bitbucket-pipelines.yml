@@ -1,0 +1,252 @@
+image:
+  name: 281892538870.dkr.ecr.us-east-1.amazonaws.com/atmailtech/atmail-build-agent:latest
+  aws:
+    access-key: $AWS_ACCESS_KEY_ID
+    secret-key: $AWS_SECRET_ACCESS_KEY
+
+options:
+  docker: true
+  max-time: 10
+
+definitions:
+  services:
+    docker:
+      memory: 3072
+    mysql:
+      image: mariadb:10.8.5
+      variables:
+        MARIADB_DATABASE: "authapi"
+        MARIADB_ROOT_PASSWORD: "changeme"
+    redis:
+      image: redis:6.2.6
+      command: ["redis-server", "--bind", "redis", "--port", "6379"]
+  steps:
+    - step: &ADMINAPITESTS
+        name: run authapi tests
+        size: 2x
+        services:
+          - docker
+          - mysql
+          - redis
+        script:
+          - source bitbucket-ssh.sh
+          - export MYSQL_HOST=$(get-host-ip.sh)
+          - export AUTHAPI_TEST_DSN="root:changeme@tcp(${MYSQL_HOST}:3306)/authapi"
+          - export REDIS_URL="redis://${MYSQL_HOST}"
+          - wait-for-service.sh ${MYSQL_HOST} 3306
+          - export VERBOSE=true
+          - echo ${AUTHAPI_TEST_DSN}
+          - echo ${REDIS_URL}
+          - mysql --host=${MYSQL_HOST} --user=root --password=changeme --database=authapi < ./sqlc/generated/mailserver.schema.sql
+          - mysql --host=${MYSQL_HOST} --user=root --password=changeme --database=authapi < ./sqlc/mailserver.data.sql
+          - make test
+        artifacts:
+          - "test-reports/*"
+    - step: &DOCKER-IMAGE
+        name: build authapi images
+        size: 2x
+        services:
+          - docker
+        script:
+          - source env.inc
+          - echo $VERSION
+          - echo $DOCKER_REPOSITORY
+          - export DOCKER_BUILDKIT=1
+          - export TARGETARCH=amd64
+          - echo "Building authapi"
+          - source bitbucket-ssh.sh
+          - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${DOCKER_REGISTRY}
+          - docker build -f Dockerfile --pull --build-arg "TARGETARCH=amd64" . -t ${DOCKER_REPOSITORY}/authapi:$VERSION-$TARGETARCH --ssh=default
+          - docker tag ${DOCKER_REPOSITORY}/authapi:$VERSION-$TARGETARCH ${DOCKER_REPOSITORY}/authapi:$VERSION
+          - docker push --all-tags ${DOCKER_REPOSITORY}/authapi
+
+    - step: &RPM
+        name: build authapi RPM
+        size: 2x
+        services:
+          - docker
+        script:
+          - source bitbucket-ssh.sh
+          - make rpm
+          - ls -l *.rpm
+        artifacts:
+          - "*.rpm"
+          - "*.deb"
+
+    - step: &SNYK
+        name: run snyk
+        image:
+          name: 281892538870.dkr.ecr.us-east-1.amazonaws.com/atmailtech/security-snyk:latest
+          aws:
+            access-key: $AWS_ACCESS_KEY_ID
+            secret-key: $AWS_SECRET_ACCESS_KEY
+        script:
+          - ./ci/bitbucket-git-setup.sh
+          - snyk test --policy-path=/root/.snyk --severity-threshold=high
+    - step: &VULN-CHECK
+        name: vulnerability checker
+        image: golang:latest
+        script:
+          - source ./ci/bitbucket-git-setup.sh
+          - make vuln-check
+    - step: &build-deb-amd64
+        name: build debian package (amd64)
+        size: 2x
+        artifacts:
+          download: false
+        script:
+          - source bitbucket-ssh.sh
+          - make TARGETARCH=amd64 deb
+          - mv build/*.deb .
+          - ls -l *.deb
+        artifacts:
+          - "*.deb"
+    - step: &build-deb-arm64
+        name: build debian package (arm64)
+        size: 2x
+        artifacts:
+          download: false
+        runs-on:
+          - 'self.hosted'
+          - 'linux.arm64'
+        script:
+          - source bitbucket-ssh.sh
+          - make TARGETARCH=arm64 deb
+          - mv build/*.deb .
+          - ls -l *.deb
+        artifacts:
+          - "*.deb"
+    - step: &compare-packages
+        name: compare packages
+        clone:
+          enabled: false
+        script:
+          - ls -l *.rpm
+          - ls -l *.deb
+          - compare_deb_rpm.sh $(ls -1 *amd64.deb) $(ls -1 *.rpm)
+          - cat package_comparison_report.txt    
+
+
+
+pipelines:
+  custom:
+    snyk-alert:
+      import: shared-go-pipelines:main:snyk-alert
+    test:
+      - step: *ADMINAPITESTS
+      - step: *VULN-CHECK
+    build:
+      - step:
+          name: set build tag
+          artifacts:
+            download: false
+          script:
+            - source bitbucket-ssh.sh
+            - echo export VERSION="$(git rev-parse HEAD)" > env.inc
+            - echo export DOCKER_REPOSITORY="${DOCKER_REGISTRY}/dev" >> env.inc
+          artifacts:
+            - env.inc
+      - parallel:
+          - step: *RPM
+          - step: *DOCKER-IMAGE
+          - step: *build-deb-amd64
+          - step: *build-deb-arm64
+      - step: *compare-packages
+
+    pull-requests:
+      - parallel:
+          - step: *VULN-CHECK
+          - step: *ADMINAPITESTS
+          - step: *SNYK
+          - step:
+              name: set build tag
+              artifacts:
+                download: false
+              script:
+                - source bitbucket-ssh.sh
+                - echo export VERSION="$(git rev-parse HEAD)" > env.inc
+                - echo export DOCKER_REPOSITORY="${DOCKER_REGISTRY}/dev" >> env.inc
+              artifacts:
+                - env.inc
+      - parallel:
+          - step: *RPM
+          - step: *DOCKER-IMAGE
+          - step: *build-deb-amd64
+          - step: *build-deb-arm64
+      - step: *compare-packages
+
+  tags:
+    "v*-rc*":
+      - parallel:
+        - step:
+            name: check tag matches staging format
+            clone:
+              enabled: false
+            artifacts:
+              download: false
+            script:
+              - check-stg-tag.sh
+              - echo export VERSION="${BITBUCKET_TAG}" > env.inc
+              - echo export DOCKER_REPOSITORY="${DOCKER_REGISTRY}/stg" >> env.inc
+            artifacts:
+              - env.inc
+        - step: *VULN-CHECK
+        - step: *ADMINAPITESTS
+        - step: *SNYK
+      - parallel:
+        - step: *RPM
+        - step: *DOCKER-IMAGE
+        - step: *build-deb-amd64
+        - step: *build-deb-arm64
+      - parallel:
+        - step: *compare-packages
+        - step:
+            name: deploy release candidate to staging repository
+            clone:
+              enabled: false
+            script:
+              - ls -l *.rpm
+              - rpm-s3-upload.sh stg
+              - ls -l *.deb
+              - deb-upload.sh stg
+
+    v*:
+      - parallel:
+          - step:
+              name: check tag matches prod format
+              clone:
+                enabled: false
+              artifacts:
+                download: false
+              script:
+                - check-prod-tag.sh
+                - echo export VERSION="${BITBUCKET_TAG}" > env.inc
+                - echo export DOCKER_REPOSITORY="${DOCKER_REGISTRY}/prod" >> env.inc
+              artifacts:
+                - env.inc
+          - step: *VULN-CHECK
+          - step: *ADMINAPITESTS
+          - step: *SNYK
+      - parallel:
+          - step: *RPM
+          - step: *DOCKER-IMAGE
+          - step: *build-deb-amd64
+          - step: *build-deb-arm64
+      - parallel:
+          - step: *compare-packages
+          - step:
+              name: deploy release to staging repository
+              clone:
+                enabled: false
+              script:
+                - ls -l *.rpm
+                - rpm-s3-upload.sh stg
+          - step:
+              name: deploy release to production repository
+              clone:
+                enabled: false
+              script:
+                - ls -l *.rpm
+                - rpm-s3-upload.sh prod
+                - ls -l *.deb
+                - deb-upload.sh prod

@@ -1,0 +1,17 @@
+# Add any directories, files, or patterns you don't want to be tracked by version control
+.vscode
+.DS_Store
+*.swp
+# Build-related stuff
+test-reports/
+build/
+*.rpm
+API-external.css
+.idea
+.dccache
+*.log
+.git
+.terraform
+.venv
+__pycache__
+node_modules
